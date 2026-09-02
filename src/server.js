@@ -1,0 +1,43 @@
+import express from "express";
+import helmet from "helmet";
+import crypto from "node:crypto";
+import path from "node:path";
+import {fileURLToPath} from "node:url";
+import {config} from "./config.js";
+import {createXeroAuthUrl,createZohoAuthUrl,handleXeroCallback,handleZohoCallback} from "./oauth.js";
+import {getProviderToken,clearProviderToken} from "./tokenStore.js";
+import {discoverXeroTenants,selectXeroTenant,fetchXeroContacts} from "./xero.js";
+import {listZohoOrganizations,selectZohoOrganization} from "./zoho.js";
+import {contactsToRows,rowsToCsv} from "./csv.js";
+import {processXeroContactWebhook} from "./webhookProcessor.js";
+import {runEtl,getLastRun} from "./etl.js";
+const __dirname=path.dirname(fileURLToPath(import.meta.url)),app=express();
+app.use(helmet({contentSecurityPolicy:false}));
+app.use("/webhooks/xero",express.raw({type:"application/json",limit:"2mb"}));
+app.use(express.json({limit:"2mb"}));
+app.use(express.static(path.resolve(__dirname,"../public")));
+let lastExport={contacts:[],csv:"",rows:0,contactType:"ALL",createdAt:null};
+const err=(res,e,s=400)=>res.status(s).json({success:false,error:e?.message||"Unexpected error"});
+function esc(v){return String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");}
+function sig(req){const s=req.get("x-xero-signature"),k=config.xero.webhookKey;if(!s||!k||!Buffer.isBuffer(req.body))return false;const e=crypto.createHmac("sha256",k).update(req.body).digest("base64"),a=Buffer.from(s),b=Buffer.from(e);return a.length===b.length&&crypto.timingSafeEqual(a,b);}
+function schedAuth(req){const p=req.get("x-schedule-secret")||"",e=config.scheduleSecret;if(!e)return false;const a=Buffer.from(p),b=Buffer.from(e);return a.length===b.length&&crypto.timingSafeEqual(a,b);}
+app.get("/health",(q,r)=>r.json({status:"ok",service:"xero-zoho-catalyst-etl"}));
+app.get("/api/status",async(q,r)=>{try{const x=await getProviderToken("xero"),z=await getProviderToken("zoho");r.json({xero:{connected:!!x?.refreshToken,tenantId:x?.tenantId||null,tenantName:x?.tenantName||null},zoho:{connected:!!z?.refreshToken,organizationId:z?.organizationId||null,organizationName:z?.organizationName||null},export:{count:lastExport.contacts.length,rows:lastExport.rows,createdAt:lastExport.createdAt},lastRun:getLastRun()});}catch(e){err(r,e);}});
+app.get("/auth/xero/start",(q,r)=>{try{r.redirect(createXeroAuthUrl())}catch(e){err(r,e)}});
+app.get("/auth/xero/callback",async(q,r)=>{try{if(q.query.error)throw new Error(`Xero OAuth error: ${q.query.error}`);if(!q.query.code||!q.query.state)throw new Error("Xero callback missing code/state.");await handleXeroCallback(q.query.code,q.query.state);r.redirect("/?connected=xero")}catch(e){r.status(400).send(`<h2>Xero OAuth failed</h2><pre>${esc(e.message)}</pre><p><a href="/auth/xero/start">Reconnect Xero</a></p>`);}});
+app.get("/auth/zoho/start",(q,r)=>{try{r.redirect(createZohoAuthUrl())}catch(e){err(r,e)}});
+app.get("/auth/zoho/callback",async(q,r)=>{try{if(q.query.error)throw new Error(`Zoho OAuth error: ${q.query.error}`);if(!q.query.code||!q.query.state)throw new Error("Zoho callback missing code/state.");await handleZohoCallback(q.query.code,q.query.state);r.redirect("/?connected=zoho")}catch(e){r.status(400).send(`<h2>Zoho OAuth failed</h2><pre>${esc(e.message)}</pre><p><a href="/auth/zoho/start">Reconnect Zoho</a></p>`);}});
+app.post("/api/xero/tenants",async(q,r)=>{try{r.json({tenants:await discoverXeroTenants()})}catch(e){err(r,e)}});
+app.post("/api/xero/tenant",async(q,r)=>{try{if(!q.body?.tenantId)throw new Error("tenantId is required.");r.json({tenant:await selectXeroTenant(q.body.tenantId)})}catch(e){err(r,e)}});
+app.post("/api/zoho/organizations",async(q,r)=>{try{r.json({organizations:await listZohoOrganizations()})}catch(e){err(r,e)}});
+app.post("/api/zoho/organization",async(q,r)=>{try{if(!q.body?.organizationId)throw new Error("organizationId is required.");r.json({organization:await selectZohoOrganization(q.body.organizationId)})}catch(e){err(r,e)}});
+app.post("/api/xero/export",async(q,r)=>{try{const type=String(q.body?.contactType||config.contactType).toUpperCase(),c=await fetchXeroContacts(type),rows=contactsToRows(c),csv=rowsToCsv(rows);lastExport={contacts:c,csv,rows:rows.length,contactType:type,createdAt:new Date().toISOString()};r.json({success:true,count:c.length,rows:rows.length,contacts:c,csv})}catch(e){err(r,e)}});
+app.get("/api/export.csv",(q,r)=>{if(!lastExport.csv)return r.status(404).send("Export contacts first.");r.setHeader("Content-Type","text/csv; charset=utf-8");r.setHeader("Content-Disposition",`attachment; filename="xero-contacts-${Date.now()}.csv"`);r.send(lastExport.csv)});
+app.post("/api/etl/run",async(q,r)=>{try{r.json(await runEtl({reason:"manual",contactType:String(q.body?.contactType||config.contactType).toUpperCase()}))}catch(e){err(r,e)}});
+app.post("/api/etl/scheduled",async(q,r)=>{if(!schedAuth(q))return r.status(401).json({success:false,error:"Unauthorized scheduled request."});r.status(202).json({accepted:true});runEtl({reason:"catalyst-schedule",contactType:config.contactType}).then(x=>console.log("Scheduled ETL:",JSON.stringify(x))).catch(e=>console.error("Scheduled ETL failed:",e?.stack||e));});
+app.post("/api/disconnect/:provider",async(q,r)=>{try{if(!["xero","zoho"].includes(q.params.provider))throw new Error("Invalid provider.");await clearProviderToken(q.params.provider);if(q.params.provider==="xero")lastExport={contacts:[],csv:"",rows:0,contactType:"ALL",createdAt:null};r.json({success:true})}catch(e){err(r,e)}});
+app.post("/webhooks/xero",async(q,r)=>{try{console.log("XERO WEBHOOK RECEIVED");if(!sig(q))return r.status(401).json({success:false,error:"Invalid Xero webhook signature."});let p;try{p=JSON.parse(q.body.toString("utf8"))}catch{return r.status(400).json({success:false,error:"Invalid JSON payload."})}const events=Array.isArray(p?.events)?p.events:[];if(!events.length)return r.status(200).json({success:true});const ce=events.filter(e=>String(e?.eventCategory||"").toUpperCase()==="CONTACT");console.log("Events received:",events.length,"Contact events:",ce.length);if(ce.length)processXeroContactWebhook().then(x=>console.log("Webhook ETL:",JSON.stringify(x))).catch(e=>console.error("Webhook ETL failed:",e?.stack||e));return r.status(200).json({success:true,received:events.length,contactEvents:ce.length});}catch(e){console.error(e?.stack||e);return r.status(500).json({success:false,error:"Webhook processing failed."})}});
+app.use((q,r)=>r.sendFile(path.resolve(__dirname,"../public/index.html")));
+const PORT=Number(process.env.X_ZOHO_CATALYST_LISTEN_PORT||process.env.PORT||config.port||3000);
+const server=app.listen(PORT,"0.0.0.0",()=>console.log(`Xero -> Zoho ETL listening on ${PORT}`));
+server.on("error",e=>{if(e.code==="EADDRINUSE"){console.error(`Port ${PORT} is already in use.`);process.exit(1)}throw e});

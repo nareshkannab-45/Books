@@ -1,0 +1,5 @@
+node_modules/
+.env
+data/tokens.enc
+data/exports/
+.DS_Store

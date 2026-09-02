@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Xero → Zoho Books ETL</title>
+<style>
+*{box-sizing:border-box}body{font-family:Arial,sans-serif;max-width:1100px;margin:32px auto;padding:20px;background:#f6f7fb;color:#111827}h1{font-size:36px}section{background:#fff;padding:24px;margin:18px 0;border-radius:14px;box-shadow:0 2px 12px #0000000b}h2{margin-top:0}button,a,select{font:inherit;padding:11px 15px;margin:4px;border:1px solid #d8def0;border-radius:8px;background:#eef1ff;color:#17358f;text-decoration:none;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{border:1px solid #e4e8f2;border-radius:10px;padding:16px}.row{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.status{font-weight:700;margin:8px 0 12px}.ok{color:#16803c}.bad{color:#b42318}.muted{color:#667085}.wide{width:100%}pre{background:#111827;color:#eee;padding:16px;border-radius:8px;white-space:pre-wrap;overflow:auto;min-height:70px}.notice{padding:12px;border-radius:8px;background:#fff7e6;border:1px solid #f3d08b}.success{padding:12px;border-radius:8px;background:#ecfdf3;border:1px solid #a7e0ba}.error{padding:12px;border-radius:8px;background:#fef3f2;border:1px solid #f2b8b5}@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>Xero → Zoho Books ETL</h1>
+
+<section>
+<h2>1. Connect</h2>
+<div class="row">
+<a href="/auth/xero/start">Connect Xero</a>
+<button onclick="disconnectProvider('xero')">Disconnect Xero</button>
+<a href="/auth/zoho/start">Connect Zoho</a>
+<button onclick="disconnectProvider('zoho')">Disconnect Zoho</button>
+<button onclick="refreshAll()">Refresh status</button>
+</div>
+<div id="statusMessage" class="muted"></div>
+<div class="grid">
+<div class="card">
+<h3>Xero</h3>
+<div id="xeroStatus" class="status">Checking...</div>
+<button onclick="loadTenants()">Load Xero organizations</button>
+<select id="tenantSelect" class="wide"><option value="">Select Xero organization</option></select>
+<button id="tenantButton" onclick="selectTenant()" disabled>Select Xero organization</button>
+</div>
+<div class="card">
+<h3>Zoho Books</h3>
+<div id="zohoStatus" class="status">Checking...</div>
+<button onclick="loadOrganizations()">Load Zoho organizations</button>
+<select id="orgSelect" class="wide"><option value="">Select Zoho organization</option></select>
+<button id="orgButton" onclick="selectOrganization()" disabled>Select Zoho organization</button>
+</div>
+</div>
+<pre id="statusOutput"></pre>
+</section>
+
+<section>
+<h2>2. Export / ETL</h2>
+<div class="row">
+<button id="exportButton" onclick="exportContacts()" disabled>Export Xero contacts</button>
+<a href="/api/export.csv">Download CSV</a>
+<button id="etlButton" onclick="runEtl()" disabled>Run ETL</button>
+</div>
+<div id="actionMessage" class="notice">Connect and select both organizations first.</div>
+<pre id="output"></pre>
+</section>
+
+<section>
+<h2>3. How the process works</h2>
+<p>Xero contacts are fetched using the selected Xero tenant, converted to CSV for export/audit, then mapped and imported into the selected Zoho Books organization. Existing Zoho contact names can be skipped according to <code>SKIP_EXISTING</code>.</p>
+</section>
+
+<script>
+const $=id=>document.getElementById(id);
+async function api(url,options={}){
+  const r=await fetch(url,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});
+  const text=await r.text(); let data;
+  try{data=JSON.parse(text)}catch{data={raw:text}}
+  if(!r.ok)throw new Error(data.error||text||`HTTP ${r.status}`);
+  return data;
+}
+function setAction(msg,type='notice'){const el=$('actionMessage');el.className=type;el.textContent=msg;}
+function updateButtons(s){
+  const ready=!!(s.xero?.connected&&s.xero?.tenantId&&s.zoho?.connected&&s.zoho?.organizationId);
+  $('exportButton').disabled=!(s.xero?.connected&&s.xero?.tenantId);
+  $('etlButton').disabled=!ready;
+  $('xeroStatus').textContent=s.xero?.connected?(s.xero.tenantName?`✓ Connected — ${s.xero.tenantName}`:'✓ OAuth connected — select an organization'):'✗ Not connected';
+  $('xeroStatus').className='status '+(s.xero?.connected?'ok':'bad');
+  $('zohoStatus').textContent=s.zoho?.connected?(s.zoho?.organizationName?`✓ Connected — ${s.zoho.organizationName}`:'✓ OAuth connected — select an organization'):'✗ Not connected';
+  $('zohoStatus').className='status '+(s.zoho?.connected?'ok':'bad');
+  if(ready)setAction('Both organizations are selected. You can run the ETL.','success');
+  else if(s.xero?.connected&&!s.xero?.tenantId)setAction('Xero is connected. Load and select a Xero organization.');
+  else if(s.zoho?.connected&&!s.zoho?.organizationId)setAction('Zoho is connected. Load and select a Zoho organization.');
+}
+async function refreshAll(){
+  try{const s=await api('/api/status');$('statusOutput').textContent=JSON.stringify(s,null,2);updateButtons(s);$('statusMessage').textContent='Status refreshed.';}
+  catch(e){$('statusOutput').textContent=e.message;setAction(e.message,'error')}
+}
+async function loadTenants(){
+  try{const d=await api('/api/xero/tenants',{method:'POST',body:'{}'});const sel=$('tenantSelect');sel.innerHTML='<option value="">Select Xero organization</option>';for(const t of d.tenants||[]){const o=document.createElement('option');o.value=t.tenantId;o.textContent=`${t.tenantName||t.tenantId} (${t.tenantType||'ORGANISATION'})`;sel.appendChild(o)}$('tenantButton').disabled=true;sel.onchange=()=>{$('tenantButton').disabled=!sel.value};$('statusOutput').textContent=JSON.stringify(d,null,2);setAction(`${(d.tenants||[]).length} Xero organization(s) found.`);}
+  catch(e){$('statusOutput').textContent=e.message;setAction(e.message,'error')}
+}
+async function selectTenant(){
+  const id=$('tenantSelect').value;if(!id)return;
+  try{const d=await api('/api/xero/tenant',{method:'POST',body:JSON.stringify({tenantId:id})});$('statusOutput').textContent=JSON.stringify(d,null,2);setAction(`Selected Xero organization: ${d.tenant?.tenantName||id}`,'success');await refreshAll();}
+  catch(e){setAction(e.message,'error')}
+}
+async function loadOrganizations(){
+  try{const d=await api('/api/zoho/organizations',{method:'POST',body:'{}'});const sel=$('orgSelect');sel.innerHTML='<option value="">Select Zoho organization</option>';for(const o of d.organizations||[]){const x=document.createElement('option');x.value=o.organization_id;x.textContent=`${o.name||o.organization_id} (${o.organization_id})`;sel.appendChild(x)}$('orgButton').disabled=true;sel.onchange=()=>{$('orgButton').disabled=!sel.value};$('statusOutput').textContent=JSON.stringify(d,null,2);setAction(`${(d.organizations||[]).length} Zoho organization(s) found.`);}
+  catch(e){$('statusOutput').textContent=e.message;setAction(e.message,'error')}
+}
+async function selectOrganization(){
+  const id=$('orgSelect').value;if(!id)return;
+  try{const d=await api('/api/zoho/organization',{method:'POST',body:JSON.stringify({organizationId:id})});$('statusOutput').textContent=JSON.stringify(d,null,2);setAction(`Selected Zoho organization: ${d.organization?.name||id}`,'success');await refreshAll();}
+  catch(e){setAction(e.message,'error')}
+}
+async function exportContacts(){
+  try{setAction('Exporting contacts from Xero...');const d=await api('/api/xero/export',{method:'POST',body:JSON.stringify({contactType:'ALL'})});$('output').textContent=JSON.stringify({success:d.success,count:d.count,rows:d.rows,contacts:d.contacts},null,2);setAction(`Xero export completed: ${d.count} contacts / ${d.rows} CSV rows.`,'success');}
+  catch(e){$('output').textContent=e.message;setAction(e.message,'error')}
+}
+async function disconnectProvider(provider){
+  try{await api(`/api/disconnect/${provider}`,{method:'POST',body:'{}'});setAction(`${provider} disconnected. Reconnect it now.`);await refreshAll();}
+  catch(e){setAction(e.message,'error')}
+}
+async function runEtl(){
+  try{setAction('Running Xero → CSV → Zoho ETL...');const d=await api('/api/etl/run',{method:'POST',body:JSON.stringify({contactType:'ALL'})});$('output').textContent=JSON.stringify(d,null,2);setAction(`ETL completed: imported ${d.imported||0}, skipped ${d.skippedExisting||0}, failed ${d.failed||0}.`,d.success?'success':'error');await refreshAll();}
+  catch(e){$('output').textContent=e.message;setAction(e.message,'error')}
+}
+refreshAll();
+</script>
+</body>
+</html>
